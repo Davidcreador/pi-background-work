@@ -11,7 +11,8 @@
   },
   "files": [
     "src/**/*.ts",
-    "README.md"
+    "README.md",
+    "LICENSE"
   ],
   "scripts": {
     "test": "node --experimental-transform-types --test tests/*.test.ts",

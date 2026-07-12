@@ -1,0 +1,33 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      # The extension depends on the pi-subagents fork via file:../../../pi-subagents
+      # during development, so CI reproduces the sibling-checkout layout.
+      - uses: actions/checkout@v4
+        with:
+          path: pi-background-work
+      - uses: actions/checkout@v4
+        with:
+          repository: Davidcreador/pi-subagents
+          ref: feat/background-work-promotion
+          path: pi-subagents
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: Install
+        working-directory: pi-background-work
+        run: npm install --no-fund --no-audit
+      - name: Test (sdk + extension, includes real-bash integration)
+        working-directory: pi-background-work
+        run: npm test
+      - name: Typecheck
+        working-directory: pi-background-work
+        run: npm run typecheck
