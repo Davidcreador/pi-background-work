@@ -1,0 +1,39 @@
+{
+  "name": "pi-background-work",
+  "version": "0.1.0",
+  "description": "Promote running Pi shell commands and subagent runs into background jobs \u2014 /background, completion notifications, safe cancellation",
+  "type": "module",
+  "license": "MIT",
+  "pi": {
+    "extensions": [
+      "./src/index.ts"
+    ]
+  },
+  "files": [
+    "src/**/*.ts",
+    "README.md"
+  ],
+  "scripts": {
+    "test": "node --experimental-transform-types --test tests/*.test.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@davecodes/pi-background-work-sdk": "0.1.0",
+    "@davecodes/pi-subagents": "file:../../../pi-subagents"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "^0.80.6",
+    "@earendil-works/pi-tui": "^0.74.0",
+    "@types/node": "^24.0.0",
+    "typescript": "^5.9.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Davidcreador/pi-background-work.git",
+    "directory": "packages/extension"
+  }
+}

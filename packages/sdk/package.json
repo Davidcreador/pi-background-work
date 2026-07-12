@@ -1,0 +1,29 @@
+{
+  "name": "@davecodes/pi-background-work-sdk",
+  "version": "0.1.0",
+  "description": "Protocol types and adapter SDK for promoting foreground Pi tool executions into background jobs",
+  "type": "module",
+  "license": "MIT",
+  "main": "./src/index.ts",
+  "exports": {
+    ".": "./src/index.ts",
+    "./protocol": "./src/protocol.ts"
+  },
+  "files": [
+    "src/**/*.ts",
+    "README.md"
+  ],
+  "scripts": {
+    "test": "node --experimental-transform-types --test tests/*.test.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "typescript": "^5.9.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Davidcreador/pi-background-work.git",
+    "directory": "packages/sdk"
+  }
+}
