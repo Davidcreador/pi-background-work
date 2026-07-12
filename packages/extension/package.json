@@ -20,7 +20,7 @@
   },
   "dependencies": {
     "@davecodes/pi-background-work-sdk": "0.1.0",
-    "@davecodes/pi-subagents": "file:../../../pi-subagents"
+    "@davecodes/pi-subagents": "0.34.0-bg.0"
   },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "*",

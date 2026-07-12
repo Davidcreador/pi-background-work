@@ -93,4 +93,4 @@ npm test             # sdk + extension suites (includes real-bash integration)
 npm run typecheck
 ```
 
-Fork dependency resolves via `file:../../../pi-subagents` in dev; swap to a published version for release.
+The fork dependency resolves from npm (`@davecodes/pi-subagents`). For fork development, temporarily point it at a local checkout with `file:`.
