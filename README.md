@@ -36,6 +36,7 @@ One package registers everything:
   "maxOutputLines": 2000,
   "mutationWarnings": true,
   "statusIndicator": true,
+  "promotionYield": "interrupt",
   "bashTool": "wrap",
   "subagents": true
 }
@@ -44,6 +45,7 @@ One package registers everything:
 - `shortcut` — optional key (e.g. `"f12"`) to promote all active work. No default; conflicts with effective Pi keybindings are detected and refused.
 - `statusIndicator` — live footer indicator while background work exists: `↳ ⠼ 2 background · 3m12s` (spinner, job count, oldest-job elapsed) plus `✓ N done` for completions still awaiting delivery/acknowledgement. Clears automatically when everything drains.
 - `completionBehavior` — `notify-and-resume` triggers a turn on completion; `notify-only` just queues the message.
+- `promotionYield` — how promotion hands control back to you. The placeholder tool result only *asks* the model to stop; models tend to babysit the job with wait/poll loops. `"interrupt"` (default) ends the streaming turn like ESC — promoted jobs survive. `"steer"` queues an explicit yield instruction into the running turn. `"off"` relies on the placeholder text alone.
 - `bashTool: "off"` — leave the effective Bash tool alone (use when another extension owns `bash` and integrates the SDK itself).
 - `subagents: false` — don't register the bundled subagent tool (e.g. you run upstream `pi-subagents` and don't need subagent promotion).
 

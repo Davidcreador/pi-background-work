@@ -80,7 +80,7 @@ export async function executeDetachableBash<TResult extends ToolResultLike>(
       };
     },
     promotedResult: (jobId) => ({
-      content: [{ type: "text", text: `Backgrounded as ${jobId}. Inspect with /background-jobs.` }],
+      content: [{ type: "text", text: `Backgrounded as ${jobId} at the user's request. The result will be delivered to you automatically in a later message when the command finishes — do not wait, sleep, poll, or re-run it. Finish any unrelated work and end your turn so the user can keep chatting.` }],
       details: { backgroundWork: { jobId, state: "background" } },
     }) as TResult,
   });

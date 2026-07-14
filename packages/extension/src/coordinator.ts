@@ -207,6 +207,29 @@ export default function backgroundWorkCoordinator(pi: ExtensionAPI, preloaded?: 
     }),
   );
 
+  /**
+   * Hand control back to the user after promotion. The promoted placeholder
+   * result only asks the model to yield — models tend to babysit the job with
+   * wait/poll loops instead. "interrupt" ends the streaming turn like ESC
+   * (promoted jobs survive: cancellation ownership already moved to the
+   * coordinator); "steer" queues an explicit yield instruction into the turn.
+   */
+  const yieldAfterPromotion = async (ctx: ExtensionContext, jobIds: string[]) => {
+    if (config.promotionYield === "off" || ctx.isIdle?.() !== false) return;
+    if (config.promotionYield === "steer") {
+      pi.sendMessage({
+        customType: "background-work-yield",
+        content: `The user backgrounded ${jobIds.join(", ")}. Results will be delivered automatically when the jobs finish — stop waiting or polling for them and end your turn now.`,
+        display: false,
+        details: { jobIds },
+      }, { deliverAs: "steer" });
+      return;
+    }
+    // Let the promoted placeholder tool results settle into the turn first.
+    await new Promise((resolve) => setImmediate(resolve));
+    if (ctx.isIdle?.() === false) ctx.abort();
+  };
+
   pi.registerCommand("background", {
     description: "Promote all active detachable shell/subagent work to the background",
     handler: async (_args, ctx) => {
@@ -221,6 +244,7 @@ export default function backgroundWorkCoordinator(pi: ExtensionAPI, preloaded?: 
         return;
       }
       ctx.ui.notify(`Backgrounded ${promoted.length} job${promoted.length === 1 ? "" : "s"}: ${promoted.map((job) => job.jobId).join(", ")}`, "info");
+      await yieldAfterPromotion(ctx, promoted.map((job) => job.jobId));
     },
   });
 
@@ -282,6 +306,7 @@ export default function backgroundWorkCoordinator(pi: ExtensionAPI, preloaded?: 
         `Enabled: ${config.enabled}`,
         `Config: ${loaded.path}${loaded.error ? ` (${loaded.error})` : ""}`,
         `Shortcut: ${config.shortcut ?? "none"}${conflict ? ` (conflicts with ${conflict})` : ""}`,
+        `Promotion yield: ${config.promotionYield}`,
         `Session: ${shared.store.sessionId || "not started"}`,
         `Role: ${shared.store.role ?? "ordinary"}`,
         `Group: ${shared.store.groupId ?? "none"}`,
@@ -305,6 +330,7 @@ export default function backgroundWorkCoordinator(pi: ExtensionAPI, preloaded?: 
           activeContext = ctx;
           const promoted = manager.promoteAll();
           ctx.ui.notify(promoted.length ? `Backgrounded ${promoted.length} job${promoted.length === 1 ? "" : "s"}.` : "No active detachable work.", "info");
+          if (promoted.length) await yieldAfterPromotion(ctx, promoted.map((job) => job.jobId));
         },
       });
     }

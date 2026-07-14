@@ -15,6 +15,13 @@ export interface BackgroundWorkConfig {
   mutationWarnings: boolean;
   /** Show a live footer indicator (spinner, counts, elapsed) while background jobs run or completions await delivery. */
   statusIndicator: boolean;
+  /**
+   * How to hand control back after promotion. The placeholder tool result only
+   * asks the model to yield; "interrupt" ends the streaming turn like ESC
+   * (promoted jobs survive), "steer" queues an explicit yield instruction into
+   * the running turn, "off" relies on the placeholder text alone.
+   */
+  promotionYield: "interrupt" | "steer" | "off";
   /** "wrap" registers a promotion-capable Bash tool; "off" leaves the effective Bash tool untouched. */
   bashTool: "wrap" | "off";
   /** Register the bundled promotion-capable subagent tool (@davecodes/pi-subagents). */
@@ -34,6 +41,7 @@ export const DEFAULT_BACKGROUND_WORK_CONFIG: BackgroundWorkConfig = {
   maxOutputLines: 2_000,
   mutationWarnings: true,
   statusIndicator: true,
+  promotionYield: "interrupt",
   bashTool: "wrap",
   subagents: true,
 };
@@ -62,6 +70,7 @@ export function parseBackgroundWorkConfig(value: unknown): BackgroundWorkConfig 
     maxOutputLines: finiteInteger(raw.maxOutputLines, DEFAULT_BACKGROUND_WORK_CONFIG.maxOutputLines, 10, 20_000),
     mutationWarnings: typeof raw.mutationWarnings === "boolean" ? raw.mutationWarnings : DEFAULT_BACKGROUND_WORK_CONFIG.mutationWarnings,
     statusIndicator: typeof raw.statusIndicator === "boolean" ? raw.statusIndicator : DEFAULT_BACKGROUND_WORK_CONFIG.statusIndicator,
+    promotionYield: raw.promotionYield === "steer" || raw.promotionYield === "off" ? raw.promotionYield : "interrupt",
     bashTool: raw.bashTool === "off" ? "off" : "wrap",
     subagents: typeof raw.subagents === "boolean" ? raw.subagents : DEFAULT_BACKGROUND_WORK_CONFIG.subagents,
   };

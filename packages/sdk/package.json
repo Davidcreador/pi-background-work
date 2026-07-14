@@ -1,6 +1,6 @@
 {
   "name": "@davecodes/pi-background-work-sdk",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Protocol types and adapter SDK for promoting foreground Pi tool executions into background jobs",
   "type": "module",
   "license": "MIT",

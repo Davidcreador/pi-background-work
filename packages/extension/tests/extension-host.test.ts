@@ -5,6 +5,13 @@ import path from "node:path";
 import test from "node:test";
 import backgroundWorkExtension from "../src/coordinator.ts";
 
+// Harness sessions export role/mission env vars; that group identity must not
+// leak into these fixtures or every ordinary registration is rejected.
+delete process.env.PI_BACKGROUND_WORK_ROLE;
+delete process.env.PI_BACKGROUND_WORK_GROUP_ID;
+delete process.env.AGENT_HARNESS_ROLE;
+delete process.env.AGENT_HARNESS_MISSION_ID;
+
 class EventBus {
   listeners = new Map<string, Set<(value: unknown) => void>>();
   on(name: string, handler: (value: unknown) => void) {
@@ -90,6 +97,30 @@ test("footer indicator animates while jobs run, shows undelivered completions, a
     lifecycle.get("context")?.at(-1)({ messages: [{ role: "custom", ...sent[0] }] });
     assert.equal(statuses.at(-1), undefined);
   } finally { if (previous === undefined) delete process.env.PI_BACKGROUND_WORK_CONFIG; else process.env.PI_BACKGROUND_WORK_CONFIG = previous; }
+});
+
+test("promotion yields the streaming turn: interrupt aborts, steer nudges, off leaves it alone", async () => {
+  const run = async (promotionYield: string) => {
+    const configPath = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "bg-yield-")), "config.json");
+    fs.writeFileSync(configPath, JSON.stringify({ enabled: true, promotionYield }));
+    const previous = process.env.PI_BACKGROUND_WORK_CONFIG; process.env.PI_BACKGROUND_WORK_CONFIG = configPath;
+    try {
+      const bus = new EventBus(); const lifecycle = new Map<string, any[]>(); const commands = new Map<string, any>(); const sent: any[] = []; let aborts = 0; let idle = false;
+      const pi: any = { events: bus, registerCommand(name: string, definition: unknown) { commands.set(name, definition); }, registerShortcut() {}, appendEntry() {}, sendMessage(message: unknown, options: unknown) { sent.push([message, options]); }, on(name: string, handler: unknown) { const list = lifecycle.get(name) ?? []; list.push(handler); lifecycle.set(name, list); } };
+      backgroundWorkExtension(pi);
+      const ctx: any = { sessionManager: { getSessionFile: () => "/tmp/yield.jsonl" }, hasUI: true, ui: { setStatus() {}, notify() {} }, isIdle: () => idle, abort() { aborts++; idle = true; } };
+      lifecycle.get("session_start")?.at(-1)({ reason: "startup" }, ctx);
+      const crypto = await import("node:crypto"); const sessionId = crypto.createHash("sha1").update("/tmp/yield.jsonl").digest("hex").slice(0, 16);
+      let promoted = false;
+      const execution: any = { protocolVersion: 1, jobId: "yield-job", adapterInstanceId: "a", sessionId, toolCallId: "t", toolName: "bash", kind: "shell", label: "sleep", startedAt: 1, mutationRisk: "unknown", promote() { promoted = true; return { promoted: true, jobId: this.jobId }; }, cancel() {}, inspect() { return { jobId: this.jobId, sessionId, toolCallId: "t", toolName: "bash", kind: "shell", label: "sleep", startedAt: 1, state: promoted ? "background-running" : "foreground-running", mutationRisk: "unknown" }; }, completion: new Promise(() => {}) };
+      bus.emit("background-work:v1:register", execution);
+      await commands.get("background").handler("", ctx);
+      return { aborts, steers: sent.filter(([message, options]) => (message as any).customType === "background-work-yield" && (options as any)?.deliverAs === "steer").length };
+    } finally { if (previous === undefined) delete process.env.PI_BACKGROUND_WORK_CONFIG; else process.env.PI_BACKGROUND_WORK_CONFIG = previous; }
+  };
+  assert.deepEqual(await run("interrupt"), { aborts: 1, steers: 0 });
+  assert.deepEqual(await run("steer"), { aborts: 0, steers: 1 });
+  assert.deepEqual(await run("off"), { aborts: 0, steers: 0 });
 });
 
 test("resources_discover contributes the bundled fork's skills and prompts wherever npm placed it", async () => {
