@@ -15,10 +15,15 @@ import {
 } from "@davecodes/pi-background-work-sdk";
 import { boundedString, CompletionDelivery } from "./completion-delivery.ts";
 import { detectShortcutConflict, loadBackgroundWorkConfig } from "./config.ts";
+import { openBackgroundWorkConfig } from "./config-ui.ts";
 import { BackgroundJobManager, createBackgroundWorkStore, type BackgroundWorkStore } from "./job-manager.ts";
+import { openJobPalette, type JobPaletteItem } from "./job-palette.ts";
+import { boundedJobOutput, formatJobLabel, sortJobsForDisplay } from "./job-presentation.ts";
 
 const GLOBAL_KEY = Symbol.for("pi-background-work.coordinator.v1");
 const MUTATION_WARNING_TTL_MS = 30_000;
+const INSPECTION_MAX_BYTES = 8 * 1024;
+const INSPECTION_MAX_LINES = 120;
 
 interface GlobalCoordinator {
   store: BackgroundWorkStore;
@@ -28,6 +33,8 @@ interface GlobalCoordinator {
   lastDeliveryError?: string;
   supervisorPending: Set<string>;
   readyAdapters: Set<string>;
+  userInputSequence: number;
+  promotionInputSequences: Map<string, number>;
   /** Footer indicator refresh timer; live only while jobs run or completions await delivery. */
   statusTimer?: NodeJS.Timeout;
 }
@@ -40,12 +47,10 @@ function globalCoordinator(): GlobalCoordinator {
     warningTimes: new Map(),
     supervisorPending: new Set(),
     readyAdapters: new Set(),
+    userInputSequence: 0,
+    promotionInputSequences: new Map(),
   };
   return root[GLOBAL_KEY];
-}
-
-function formatElapsed(startedAt: number, finishedAt = Date.now()): string {
-  return `${Math.max(0, (finishedAt - startedAt) / 1000).toFixed(1)}s`;
 }
 
 const STATUS_SPINNER = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -57,10 +62,6 @@ function formatElapsedShort(startedAt: number, now = Date.now()): string {
   const minutes = Math.floor(seconds / 60);
   if (minutes < 60) return `${minutes}m${String(seconds % 60).padStart(2, "0")}s`;
   return `${Math.floor(minutes / 60)}h${String(minutes % 60).padStart(2, "0")}m`;
-}
-
-function summarizeJob(snapshot: BackgroundJobSnapshot): string {
-  return `${snapshot.jobId} · ${snapshot.kind} · ${snapshot.state} · ${formatElapsed(snapshot.startedAt, snapshot.finishedAt)} · ${snapshot.label}`;
 }
 
 function isDetachableExecution(value: unknown): value is DetachableExecution {
@@ -81,6 +82,8 @@ export default function backgroundWorkCoordinator(pi: ExtensionAPI, preloaded?: 
   const shared = globalCoordinator();
   shared.supervisorPending = shared.supervisorPending instanceof Set ? shared.supervisorPending : new Set();
   shared.readyAdapters ??= new Set();
+  shared.userInputSequence ??= 0;
+  shared.promotionInputSequences ??= new Map();
   for (const dispose of shared.disposers.splice(0)) {
     try { dispose(); } catch { /* stale reload cleanup is best effort */ }
   }
@@ -94,8 +97,10 @@ export default function backgroundWorkCoordinator(pi: ExtensionAPI, preloaded?: 
   const loaded = preloaded ?? loadBackgroundWorkConfig();
   const config = loaded.config;
   const metadata = resolveGroupIdentity();
+  const promotionAction = config.shortcut && !detectShortcutConflict(config.shortcut) ? config.shortcut : "/background";
   let activeContext: ExtensionContext | undefined;
   let agentBusy = false;
+  let userUiBusy = false;
   let spinnerFrame = 0;
   /** Set on non-reload shutdown so late cancellation transitions cannot restart the ticker. */
   let shuttingDown = false;
@@ -105,23 +110,32 @@ export default function backgroundWorkCoordinator(pi: ExtensionAPI, preloaded?: 
   };
 
   /**
-   * Live footer indicator. Two independent signals share one status entry:
-   *   - running jobs: animated spinner + count + oldest-job elapsed time
+   * Live footer indicator. Three signals share one status entry:
+   *   - foreground work that can be promoted: kind/count + the promotion action
+   *   - background jobs: animated spinner + count + oldest-job elapsed time
    *   - finished jobs awaiting delivery/acknowledgement: check mark + count
-   * A 1s ticker animates and refreshes elapsed time only while there is
-   * something to show; it stops (and the status clears) once both drain.
+   * The 1s ticker runs only while elapsed background work needs refreshing.
    */
   const updateStatusIndicator = () => {
-    if (!config.statusIndicator) return;
+    if (!config.statusIndicator) {
+      stopStatusTicker();
+      if (activeContext?.hasUI) activeContext.ui.setStatus("background-work", undefined);
+      return;
+    }
+    const detachable = manager.detachableSnapshots();
     const active = manager.activeSnapshots();
     const undelivered = shared.store.pendingDeliveries.length + shared.store.queued.size;
-    if (!active.length && !undelivered) {
+    if (!detachable.length && !active.length && !undelivered) {
       stopStatusTicker();
       if (activeContext?.hasUI) activeContext.ui.setStatus("background-work", undefined);
       return;
     }
     if (activeContext?.hasUI) {
       const parts: string[] = [];
+      if (detachable.length) {
+        const subject = detachable.length === 1 ? `${detachable[0]!.kind} running` : `${detachable.length} jobs running`;
+        parts.push(`${subject} · ${promotionAction} available`);
+      }
       if (active.length) {
         spinnerFrame = (spinnerFrame + 1) % STATUS_SPINNER.length;
         const oldest = Math.min(...active.map((job) => job.startedAt));
@@ -130,9 +144,11 @@ export default function backgroundWorkCoordinator(pi: ExtensionAPI, preloaded?: 
       if (undelivered) parts.push(`✓ ${undelivered} done`);
       activeContext.ui.setStatus("background-work", `↳ ${parts.join(" · ")}`);
     }
-    if (!shared.statusTimer && !shuttingDown) {
+    if (active.length && !shared.statusTimer && !shuttingDown) {
       shared.statusTimer = setInterval(updateStatusIndicator, 1_000);
       shared.statusTimer.unref?.();
+    } else if (!active.length) {
+      stopStatusTicker();
     }
   };
 
@@ -167,14 +183,15 @@ export default function backgroundWorkCoordinator(pi: ExtensionAPI, preloaded?: 
       maxOutputBytes: config.maxOutputBytes,
       maxOutputLines: config.maxOutputLines,
       completionBehavior: config.completionBehavior,
+      shouldResume: (jobIds) => jobIds.some((jobId) => shared.promotionInputSequences.get(jobId) === shared.userInputSequence),
       role: shared.store.role,
       groupId: shared.store.groupId,
       onQueued: (jobIds) => manager.markQueued(jobIds),
       onError: (error) => { shared.lastDeliveryError = error.message; },
     });
     // Completion is enqueued only at an idle seam. User steering and supervisor/intercom work already queued for the active turn therefore win.
-    shared.store.notify = () => { if (!agentBusy && shared.supervisorPending.size === 0) shared.delivery?.schedule(); };
-    if (!agentBusy && shared.supervisorPending.size === 0 && shared.store.pendingDeliveries.length) shared.delivery.schedule();
+    shared.store.notify = () => { if (!agentBusy && !userUiBusy && shared.supervisorPending.size === 0) shared.delivery?.schedule(); };
+    if (!agentBusy && !userUiBusy && shared.supervisorPending.size === 0 && shared.store.pendingDeliveries.length) shared.delivery.schedule();
   };
 
   shared.disposers.push(
@@ -203,7 +220,7 @@ export default function backgroundWorkCoordinator(pi: ExtensionAPI, preloaded?: 
       if (typeof event.requestId !== "string" || !event.requestId || event.sessionId !== shared.store.sessionId) return;
       if (event.pending === true) shared.supervisorPending.add(event.requestId);
       if (event.pending === false) shared.supervisorPending.delete(event.requestId);
-      if (!agentBusy && shared.supervisorPending.size === 0 && shared.store.pendingDeliveries.length) shared.delivery?.schedule();
+      if (!agentBusy && !userUiBusy && shared.supervisorPending.size === 0 && shared.store.pendingDeliveries.length) shared.delivery?.schedule();
     }),
   );
 
@@ -230,15 +247,88 @@ export default function backgroundWorkCoordinator(pi: ExtensionAPI, preloaded?: 
     if (ctx.isIdle?.() === false) ctx.abort();
   };
 
+  const recordPromotions = (jobs: BackgroundJobSnapshot[]) => {
+    for (const job of jobs) shared.promotionInputSequences.set(job.jobId, shared.userInputSequence);
+  };
+
+  const paletteItems = (): JobPaletteItem[] => sortJobsForDisplay(manager.allSnapshots()).map((job) => ({
+    job,
+    canCancel: job.state === "background-running",
+    ...(shared.store.pendingDeliveries.some((item) => item.jobId === job.jobId)
+      ? { retry: "pending" as const }
+      : shared.store.queued.has(job.jobId) ? { retry: "queued" as const } : {}),
+  }));
+
+  const inspectJob = (ctx: ExtensionContext, job: BackgroundJobSnapshot) => {
+    const error = boundedString(job.error, 512);
+    const artifactPath = boundedString(job.artifactPath, 512);
+    const output = boundedJobOutput(
+      job.latestOutput ?? "",
+      Math.min(config.maxOutputBytes, INSPECTION_MAX_BYTES),
+      Math.min(config.maxOutputLines, INSPECTION_MAX_LINES),
+    );
+    ctx.ui.notify([
+      formatJobLabel(job),
+      `Mutation risk: ${job.mutationRisk}`,
+      error ? `Error: ${error}` : "",
+      output ? `Output:\n${output}` : "Output: (none)",
+      artifactPath ? `Full output: ${artifactPath}` : "",
+    ].filter(Boolean).join("\n"), job.state === "failed" || job.state === "timed-out" ? "error" : "info");
+  };
+
+  const cancelJob = async (ctx: ExtensionContext, job: BackgroundJobSnapshot) => {
+    const label = boundedString(job.label, 96) ?? job.jobId;
+    const confirmed = job.mutationRisk === "read-only" || await ctx.ui.confirm("Cancel background job?", `${label} (${job.jobId})`);
+    if (!confirmed) return;
+    ctx.ui.notify(`Cancelling ${label}…`, "info");
+    try {
+      const cancelled = await manager.cancel(job.jobId);
+      const settled = manager.allSnapshots().find((snapshot) => snapshot.jobId === job.jobId);
+      if (!cancelled) ctx.ui.notify(`${label} is no longer running.`, "info");
+      else if (settled?.state === "cancelled") ctx.ui.notify(`Cancelled ${label}.`, "info");
+      else ctx.ui.notify(`${label} finished as ${settled?.state ?? "unknown"} while cancellation was requested.`, settled?.state === "succeeded" ? "info" : "warning");
+    } catch (error) {
+      ctx.ui.notify(`Could not cancel ${label}: ${boundedString(error instanceof Error ? error.message : error, 256) ?? "unknown error"}`, "error");
+    }
+  };
+
+  const retryDelivery = async (ctx: ExtensionContext, jobId: string, queued: boolean) => {
+    if (queued) {
+      const confirmed = await ctx.ui.confirm("Retry already-enqueued completion?", "Pi has not acknowledged context consumption. Retrying is explicit and may duplicate a message that was queued internally.");
+      if (!confirmed) return;
+      if (!manager.retryQueued(jobId)) {
+        ctx.ui.notify("That completion is no longer awaiting acknowledgement.", "info");
+        return;
+      }
+    }
+    if (agentBusy || shared.supervisorPending.size > 0) ctx.ui.notify("Completion retry queued until user/supervisor work ends.", "info");
+    else {
+      if (!userUiBusy) shared.delivery?.schedule();
+      ctx.ui.notify("Completion delivery retry requested.", "info");
+    }
+  };
+
+  const runUserUi = async (run: () => Promise<void>) => {
+    userUiBusy = true;
+    shared.delivery?.pause();
+    try {
+      await run();
+    } finally {
+      userUiBusy = false;
+      if (!agentBusy && shared.supervisorPending.size === 0 && shared.store.pendingDeliveries.length) shared.delivery?.schedule();
+    }
+  };
+
   pi.registerCommand("background", {
     description: "Promote all active detachable shell/subagent work to the background",
     handler: async (_args, ctx) => {
       activeContext = ctx;
       if (!config.enabled) {
-        ctx.ui.notify(`Background work is disabled in ${loaded.path}.`, "warning");
+        ctx.ui.notify(`Background work is disabled in ${loaded.path}. Run /background-config to enable it.`, "warning");
         return;
       }
       const promoted = manager.promoteAll();
+      recordPromotions(promoted);
       if (!promoted.length) {
         ctx.ui.notify("No active detachable work to background.", "info");
         return;
@@ -248,52 +338,65 @@ export default function backgroundWorkCoordinator(pi: ExtensionAPI, preloaded?: 
     },
   });
 
+  pi.registerCommand("background-config", {
+    description: "Configure background work and reload Pi",
+    handler: async (_args, ctx) => {
+      activeContext = ctx;
+      await runUserUi(() => openBackgroundWorkConfig(ctx, loaded));
+    },
+  });
+
   pi.registerCommand("background-jobs", {
     description: "Inspect or cancel promoted background jobs",
     handler: async (_args, ctx) => {
       activeContext = ctx;
       if (!config.enabled) {
-        ctx.ui.notify(`Background work is disabled in ${loaded.path}.`, "warning");
+        ctx.ui.notify(`Background work is disabled in ${loaded.path}. Run /background-config to enable it.`, "warning");
         return;
       }
-      const jobs = manager.allSnapshots();
-      if (!jobs.length) {
-        ctx.ui.notify("No background-work jobs in this session.", "info");
-        return;
-      }
-      const labels = jobs.map(summarizeJob);
-      const selected = await ctx.ui.select("Background jobs", labels);
-      const index = selected ? labels.indexOf(selected) : -1;
-      if (index < 0) return;
-      const job = jobs[index]!;
-      const pendingDelivery = shared.store.pendingDeliveries.some((item) => item.jobId === job.jobId);
-      const queuedDelivery = shared.store.queued.has(job.jobId);
-      const actions = job.state === "background-running" || job.state === "cancelling"
-        ? ["Inspect", "Cancel"]
-        : pendingDelivery ? ["Inspect", "Retry completion delivery"]
-          : queuedDelivery ? ["Inspect", "Retry queued completion (may duplicate)"] : ["Inspect"];
-      const action = await ctx.ui.select(job.jobId, actions);
-      if (action === "Inspect") {
-        ctx.ui.notify([
-          summarizeJob(job),
-          `Mutation risk: ${job.mutationRisk}`,
-          job.error ? `Error: ${job.error}` : "",
-          job.latestOutput ?? "",
-          job.artifactPath ? `Full output: ${job.artifactPath}` : "",
-        ].filter(Boolean).join("\n"), job.error ? "error" : "info");
-      } else if (action === "Cancel") {
-        const confirmed = job.mutationRisk === "read-only" || await ctx.ui.confirm("Cancel background job?", `${job.jobId}: ${job.label}`);
-        if (confirmed) await manager.cancel(job.jobId);
-      } else if (action === "Retry completion delivery") {
-        if (agentBusy || shared.supervisorPending.size > 0) ctx.ui.notify("Completion retry queued until user/supervisor work ends.", "info");
-        else shared.delivery?.schedule();
-      } else if (action === "Retry queued completion (may duplicate)") {
-        const confirmed = await ctx.ui.confirm("Retry already-enqueued completion?", "Pi has not acknowledged context consumption. Retrying is explicit and may duplicate a message that was queued internally.");
-        if (confirmed && manager.retryQueued(job.jobId)) {
-          if (agentBusy || shared.supervisorPending.size > 0) ctx.ui.notify("Explicit retry queued until user/supervisor work ends.", "info");
-          else shared.delivery?.schedule();
+      await runUserUi(async () => {
+        const jobs = sortJobsForDisplay(manager.allSnapshots());
+        if (!jobs.length) {
+          ctx.ui.notify("No background-work jobs in this session.", "info");
+          return;
         }
-      }
+        if (ctx.mode === "tui") {
+          while (true) {
+            const result = await openJobPalette(ctx, paletteItems, {
+              maxOutputBytes: Math.min(config.maxOutputBytes, INSPECTION_MAX_BYTES),
+              maxOutputLines: Math.min(config.maxOutputLines, INSPECTION_MAX_LINES),
+            });
+            if (!result) return;
+            const current = manager.allSnapshots().find((snapshot) => snapshot.jobId === result.jobId);
+            if (!current) {
+              ctx.ui.notify("That background job is no longer available.", "info");
+              continue;
+            }
+            if (result.action === "cancel") await cancelJob(ctx, current);
+            else {
+              await retryDelivery(ctx, current.jobId, result.queued);
+              return;
+            }
+          }
+        }
+
+        const labels = jobs.map((job) => formatJobLabel(job));
+        const selected = await ctx.ui.select("Background jobs", labels);
+        const index = selected ? labels.indexOf(selected) : -1;
+        if (index < 0) return;
+        const job = jobs[index]!;
+        const pendingDelivery = shared.store.pendingDeliveries.some((item) => item.jobId === job.jobId);
+        const queuedDelivery = shared.store.queued.has(job.jobId);
+        const actions = job.state === "background-running"
+          ? ["Inspect", "Cancel"]
+          : pendingDelivery ? ["Inspect", "Retry completion delivery"]
+            : queuedDelivery ? ["Inspect", "Retry queued completion (may duplicate)"] : ["Inspect"];
+        const action = await ctx.ui.select(job.jobId, actions);
+        if (action === "Inspect") inspectJob(ctx, job);
+        else if (action === "Cancel") await cancelJob(ctx, job);
+        else if (action === "Retry completion delivery") await retryDelivery(ctx, job.jobId, false);
+        else if (action === "Retry queued completion (may duplicate)") await retryDelivery(ctx, job.jobId, true);
+      });
     },
   });
 
@@ -307,6 +410,7 @@ export default function backgroundWorkCoordinator(pi: ExtensionAPI, preloaded?: 
         `Config: ${loaded.path}${loaded.error ? ` (${loaded.error})` : ""}`,
         `Shortcut: ${config.shortcut ?? "none"}${conflict ? ` (conflicts with ${conflict})` : ""}`,
         `Promotion yield: ${config.promotionYield}`,
+        `Completion behavior: ${config.completionBehavior}`,
         `Session: ${shared.store.sessionId || "not started"}`,
         `Role: ${shared.store.role ?? "ordinary"}`,
         `Group: ${shared.store.groupId ?? "none"}`,
@@ -317,11 +421,12 @@ export default function backgroundWorkCoordinator(pi: ExtensionAPI, preloaded?: 
         `Queued awaiting context acknowledgement: ${shared.store.queued.size}`,
         `Blocking supervisor requests: ${shared.supervisorPending.size}`,
         `Last delivery error: ${shared.lastDeliveryError ?? "none"}`,
+        loaded.error || conflict ? "Repair: /background-config" : "Configure: /background-config",
       ].join("\n"), loaded.error || conflict ? "warning" : "info");
     },
   });
 
-  if (config.shortcut) {
+  if (config.enabled && config.shortcut) {
     const conflict = detectShortcutConflict(config.shortcut);
     if (!conflict) {
       pi.registerShortcut(config.shortcut as KeyId, {
@@ -329,6 +434,7 @@ export default function backgroundWorkCoordinator(pi: ExtensionAPI, preloaded?: 
         handler: async (ctx) => {
           activeContext = ctx;
           const promoted = manager.promoteAll();
+          recordPromotions(promoted);
           ctx.ui.notify(promoted.length ? `Backgrounded ${promoted.length} job${promoted.length === 1 ? "" : "s"}.` : "No active detachable work.", "info");
           if (promoted.length) await yieldAfterPromotion(ctx, promoted.map((job) => job.jobId));
         },
@@ -341,16 +447,21 @@ export default function backgroundWorkCoordinator(pi: ExtensionAPI, preloaded?: 
     // Blocking request events are generation/session scoped; stale unmatched starts must never survive reload.
     shared.supervisorPending.clear();
     const id = sessionIdFrom(ctx);
+    const preserveJobs = event.reason === "reload" && shared.store.sessionId === id;
+    if (!preserveJobs) {
+      shared.userInputSequence = 0;
+      shared.promotionInputSequences.clear();
+    }
     manager.setSession({
       sessionId: id,
       groupId: metadata.groupId,
       role: metadata.role,
-      preserveJobs: event.reason === "reload" && shared.store.sessionId === id,
+      preserveJobs,
     });
     createDelivery();
-    if (loaded.error && ctx.hasUI) ctx.ui.notify(`Background work disabled: ${loaded.error}`, "warning");
+    if (loaded.error && ctx.hasUI) ctx.ui.notify(`Background work disabled: ${loaded.error}. Run /background-config to repair it.`, "warning");
     const conflict = detectShortcutConflict(config.shortcut);
-    if (conflict && ctx.hasUI) ctx.ui.notify(`Background shortcut '${config.shortcut}' conflicts with ${conflict}; shortcut not registered.`, "warning");
+    if (conflict && ctx.hasUI) ctx.ui.notify(`Background shortcut '${config.shortcut}' conflicts with ${conflict}; shortcut not registered. Run /background-config to choose another.`, "warning");
   });
 
   const confirmSessionReplacement = async (ctx: ExtensionContext) => {
@@ -370,6 +481,10 @@ export default function backgroundWorkCoordinator(pi: ExtensionAPI, preloaded?: 
   pi.on("session_before_switch", async (_event, ctx) => confirmSessionReplacement(ctx));
   pi.on("session_before_fork", async (_event, ctx) => confirmSessionReplacement(ctx));
 
+  pi.on("input", (event) => {
+    if (event.source !== "extension") shared.userInputSequence += 1;
+  });
+
   pi.on("agent_start", () => {
     agentBusy = true;
     shared.delivery?.pause();
@@ -377,18 +492,21 @@ export default function backgroundWorkCoordinator(pi: ExtensionAPI, preloaded?: 
 
   pi.on("agent_end", () => {
     agentBusy = false;
-    if (shared.supervisorPending.size === 0 && shared.store.pendingDeliveries.length) shared.delivery?.schedule();
+    if (!userUiBusy && shared.supervisorPending.size === 0 && shared.store.pendingDeliveries.length) shared.delivery?.schedule();
   });
 
   pi.on("context", (event) => {
     for (const message of event.messages) {
       if (message.role !== "custom" || message.customType !== "background-work-completion") continue;
-      const details = message.details as { groupId?: string; completions?: Array<{ jobId?: string }> } | undefined;
+      if (typeof message.details !== "object" || message.details === null) continue;
+      const details = message.details as { version?: unknown; groupId?: unknown; completions?: unknown };
       // The sent details.groupId was normalized/truncated by the delivery
       // formatter; compare bounded-to-bounded or a >128-byte group id would
       // never acknowledge and jobs would sit "queued" forever.
-      if (details?.groupId !== boundedString(shared.store.groupId, 128)) continue;
-      manager.markDelivered((details?.completions ?? []).flatMap((item) => typeof item.jobId === "string" ? [item.jobId] : []));
+      if (details.version !== 1 || details.groupId !== boundedString(shared.store.groupId, 128) || !Array.isArray(details.completions)) continue;
+      const jobIds = details.completions.flatMap((item) => typeof item === "object" && item !== null && "jobId" in item && typeof item.jobId === "string" ? [item.jobId] : []);
+      manager.markDelivered(jobIds);
+      for (const jobId of jobIds) if (shared.store.delivered.has(jobId)) shared.promotionInputSequences.delete(jobId);
     }
   });
 

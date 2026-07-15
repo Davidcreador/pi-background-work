@@ -17,6 +17,7 @@ export interface BackgroundWorkStore {
   executions: Map<string, DetachableExecution>;
   snapshots: Map<string, BackgroundJobSnapshot>;
   completionAttached: Set<string>;
+  cancellations: Map<string, Promise<boolean>>;
   delivered: Set<string>;
   queued: Set<string>;
   queuedDeliveries: Map<string, BackgroundJobCompletion>;
@@ -40,6 +41,7 @@ export function createBackgroundWorkStore(): BackgroundWorkStore {
     executions: new Map(),
     snapshots: new Map(),
     completionAttached: new Set(),
+    cancellations: new Map(),
     delivered: new Set(),
     queued: new Set(),
     queuedDeliveries: new Map(),
@@ -67,6 +69,7 @@ export class BackgroundJobManager {
     hooks: BackgroundJobManagerHooks = {},
     private readonly cancellationTimeoutMs = 10_000,
   ) {
+    store.cancellations ??= new Map();
     store.hooks = hooks;
   }
 
@@ -170,34 +173,53 @@ export class BackgroundJobManager {
   }
 
   async cancel(jobId: string): Promise<boolean> {
+    const inFlight = this.store.cancellations.get(jobId);
+    if (inFlight) return inFlight;
     const execution = this.store.executions.get(jobId);
     const snapshot = this.store.snapshots.get(jobId);
     if (!execution || !snapshot || isTerminal(snapshot.state)) return false;
-    if (snapshot.state !== "cancelling") {
-      // Intentionally no transition entry for → cancelling: only terminal
-      // outcomes are persisted, and settle() records the terminal transition
-      // as coming from "background-running" so history shows one lifecycle
-      // edge per job regardless of how cancellation raced completion.
-      const next = { ...snapshot, state: "cancelling" as const };
-      this.store.snapshots.set(jobId, next);
-      this.store.hooks?.onStateChange?.();
-    }
-    const cancellation = Promise.resolve()
-      .then(() => execution.cancel())
-      .then(() => execution.completion);
-    let timeout: NodeJS.Timeout | undefined;
+
+    const cancellation = Promise.resolve().then(async () => {
+      const current = this.store.snapshots.get(jobId);
+      if (!current || isTerminal(current.state)) return false;
+      if (current.state !== "cancelling") {
+        // Intentionally no transition entry for → cancelling: only terminal
+        // outcomes are persisted, and settle() records the terminal transition
+        // as coming from "background-running" so history shows one lifecycle
+        // edge per job regardless of how cancellation raced completion.
+        this.store.snapshots.set(jobId, { ...current, state: "cancelling" });
+        this.store.hooks?.onStateChange?.();
+      }
+      const settled = Promise.resolve()
+        .then(() => execution.cancel())
+        .then(() => execution.completion);
+      let timeout: NodeJS.Timeout | undefined;
+      try {
+        await Promise.race([
+          settled,
+          new Promise<never>((_resolve, reject) => {
+            timeout = setTimeout(() => reject(new Error(`Timed out cancelling ${jobId} after ${this.cancellationTimeoutMs}ms`)), this.cancellationTimeoutMs);
+            timeout.unref?.();
+          }),
+        ]);
+      } finally {
+        if (timeout) clearTimeout(timeout);
+      }
+      return true;
+    });
+    this.store.cancellations.set(jobId, cancellation);
     try {
-      await Promise.race([
-        cancellation,
-        new Promise<never>((_resolve, reject) => {
-          timeout = setTimeout(() => reject(new Error(`Timed out cancelling ${jobId} after ${this.cancellationTimeoutMs}ms`)), this.cancellationTimeoutMs);
-          timeout.unref?.();
-        }),
-      ]);
+      return await cancellation;
+    } catch (error) {
+      const current = this.store.snapshots.get(jobId);
+      if (current?.state === "cancelling") {
+        this.store.snapshots.set(jobId, { ...current, state: current.promotedAt === undefined ? "foreground-running" : "background-running" });
+        this.store.hooks?.onStateChange?.();
+      }
+      throw error;
     } finally {
-      if (timeout) clearTimeout(timeout);
+      if (this.store.cancellations.get(jobId) === cancellation) this.store.cancellations.delete(jobId);
     }
-    return true;
   }
 
   async cancelAll(includeForeground = false): Promise<{ cancelled: string[]; failed: Array<{ jobId: string; error: string }> }> {
@@ -259,11 +281,15 @@ export class BackgroundJobManager {
   }
 
   markDelivered(jobIds: string[]): void {
-    for (const jobId of jobIds) {
+    const pending = new Set(this.store.pendingDeliveries.map((completion) => completion.jobId));
+    const delivered = new Set(jobIds.filter((jobId) => this.store.queued.has(jobId) || this.store.queuedDeliveries.has(jobId) || pending.has(jobId)));
+    if (!delivered.size) return;
+    for (const jobId of delivered) {
       this.store.queued.delete(jobId);
       this.store.queuedDeliveries.delete(jobId);
       this.store.delivered.add(jobId);
     }
+    this.store.pendingDeliveries = this.store.pendingDeliveries.filter((completion) => !delivered.has(completion.jobId));
     this.store.hooks?.onStateChange?.();
   }
 
@@ -271,6 +297,7 @@ export class BackgroundJobManager {
     this.store.executions.clear();
     this.store.snapshots.clear();
     this.store.completionAttached.clear();
+    this.store.cancellations.clear();
     this.store.delivered.clear();
     this.store.queued.clear();
     this.store.queuedDeliveries.clear();

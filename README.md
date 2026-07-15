@@ -1,6 +1,6 @@
 # pi-background-work
 
-Promote already-running foreground work in [Pi](https://github.com/badlogic/pi-mono) into session-bound background jobs — then get notified and auto-resume when it finishes.
+Promote already-running foreground work in [Pi](https://github.com/badlogic/pi-mono) into session-bound background jobs — then get notified and auto-resume when you have not moved on to a newer request.
 
 Type `/background` while a shell command or subagent run is executing: the original execution keeps running exactly once (never restarted, never duplicated), Pi gets its turn back immediately, and the completion is delivered as a custom message when the agent is idle.
 
@@ -18,19 +18,23 @@ pi install npm:pi-background-work
 
 One package registers everything:
 
-1. **Coordinator** — `/background`, `/background-jobs`, `/background-doctor`, completion delivery, cancellation, session/reload safety, group isolation, mutation warnings.
+1. **Coordinator** — `/background`, `/background-jobs`, `/background-config`, `/background-doctor`, completion delivery, cancellation, session/reload safety, group isolation, mutation warnings.
 2. **Detachable Bash** — wraps Pi's stock `bash` tool with a promotion gate. Identical execution semantics; only result delivery is raceable.
 3. **Bundled subagents** — [`@davecodes/pi-subagents`](../pi-subagents), a fork of [pi-subagents](https://github.com/nicobailon/pi-subagents) with top-level foreground-run promotion (single, parallel, and chain runs). **Replaces** a standalone `npm:pi-subagents` entry — remove that entry from your settings to avoid double tool registration.
 
+`/background-jobs` opens a live TUI palette with active work first, recent terminal results, bounded head/tail output, expandable detail, and direct `c`ancel/`r`etry actions. RPC and other UI modes retain the simpler selector flow.
+
 ## Configuration
 
-`~/.pi/agent/background-work.json` (all optional):
+Run `/background-config` to edit common settings and reload Pi immediately. Invalid JSON can be repaired there; the original file is backed up before defaults are restored. `/background-doctor` reports the effective path, parse errors, shortcut conflicts, adapters, and delivery state.
+
+For manual editing, update `~/.pi/agent/background-work.json` (all fields optional), then run `/reload`:
 
 ```json
 {
   "enabled": true,
   "shortcut": null,
-  "completionBehavior": "notify-and-resume",
+  "completionBehavior": "adaptive",
   "completionDebounceMs": 200,
   "maxOutputBytes": 51200,
   "maxOutputLines": 2000,
@@ -43,8 +47,9 @@ One package registers everything:
 ```
 
 - `shortcut` — optional key (e.g. `"f12"`) to promote all active work. No default; conflicts with effective Pi keybindings are detected and refused.
-- `statusIndicator` — live footer indicator while background work exists: `↳ ⠼ 2 background · 3m12s` (spinner, job count, oldest-job elapsed) plus `✓ N done` for completions still awaiting delivery/acknowledgement. Clears automatically when everything drains.
-- `completionBehavior` — `notify-and-resume` triggers a turn on completion; `notify-only` just queues the message.
+- `statusIndicator` — live footer affordance while foreground work can be promoted (`↳ shell running · /background available`), then `↳ ⠼ 2 background · 3m12s` (spinner, job count, oldest-job elapsed) plus `✓ N done` for completions still awaiting delivery/acknowledgement. Uses the configured shortcut instead of `/background` when available and clears automatically when everything drains.
+- Completion messages render as compact status cards; use Pi's tool-expansion key (normally `Ctrl+O`) to reveal the full bounded output.
+- `completionBehavior` — `adaptive` (default) resumes the agent only when you have not sent another prompt since promotion. `notify-and-resume` always triggers a turn after the idle seam; `notify-only` never does.
 - `promotionYield` — how promotion hands control back to you. The placeholder tool result only *asks* the model to stop; models tend to babysit the job with wait/poll loops. `"interrupt"` (default) ends the streaming turn like ESC — promoted jobs survive. `"steer"` queues an explicit yield instruction into the running turn. `"off"` relies on the placeholder text alone.
 - `bashTool: "off"` — leave the effective Bash tool alone (use when another extension owns `bash` and integrates the SDK itself).
 - `subagents: false` — don't register the bundled subagent tool (e.g. you run upstream `pi-subagents` and don't need subagent promotion).

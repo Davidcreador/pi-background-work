@@ -1,6 +1,7 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import registerSubagentExtension from "@davecodes/pi-subagents/src/extension/index.ts";
 import { registerDetachableBash } from "./bash-tool.ts";
+import { registerCompletionMessageRenderer } from "./completion-message.ts";
 import { loadBackgroundWorkConfig } from "./config.ts";
 import backgroundWorkCoordinator from "./coordinator.ts";
 import { registerSubagentResources } from "./subagent-resources.ts";
@@ -19,6 +20,7 @@ import { registerSubagentResources } from "./subagent-resources.ts";
 export default function piBackgroundWork(pi: ExtensionAPI): void {
   const loaded = loadBackgroundWorkConfig();
   backgroundWorkCoordinator(pi, loaded);
+  registerCompletionMessageRenderer(pi);
   // The subagent tool registers regardless of `enabled` — it is a full
   // pi-subagents replacement; only promotion behavior is gated by the
   // coordinator. Bash wrapping is skipped when promotion can never trigger.
