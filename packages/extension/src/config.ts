@@ -6,7 +6,7 @@ import { TUI_KEYBINDINGS } from "@earendil-works/pi-tui";
 export interface BackgroundWorkConfig {
   enabled: boolean;
   shortcut: string | null;
-  completionBehavior: "notify-and-resume" | "notify-only";
+  completionBehavior: "adaptive" | "notify-and-resume" | "notify-only";
   promotionScope: "all-active";
   shutdownBehavior: "cancel";
   completionDebounceMs: number;
@@ -33,7 +33,7 @@ export const DEFAULT_BACKGROUND_WORK_CONFIG: BackgroundWorkConfig = {
   // shortcut which stays unset to avoid overriding any Pi keybinding.
   enabled: true,
   shortcut: null,
-  completionBehavior: "notify-and-resume",
+  completionBehavior: "adaptive",
   promotionScope: "all-active",
   shutdownBehavior: "cancel",
   completionDebounceMs: 200,
@@ -61,8 +61,10 @@ export function parseBackgroundWorkConfig(value: unknown): BackgroundWorkConfig 
   const raw = value as Record<string, unknown>;
   return {
     enabled: typeof raw.enabled === "boolean" ? raw.enabled : DEFAULT_BACKGROUND_WORK_CONFIG.enabled,
-    shortcut: typeof raw.shortcut === "string" && raw.shortcut.trim() ? raw.shortcut.trim() : null,
-    completionBehavior: raw.completionBehavior === "notify-only" ? "notify-only" : "notify-and-resume",
+    shortcut: typeof raw.shortcut === "string" ? normalizeShortcut(raw.shortcut) ?? null : null,
+    completionBehavior: raw.completionBehavior === "notify-only" || raw.completionBehavior === "notify-and-resume"
+      ? raw.completionBehavior
+      : "adaptive",
     promotionScope: "all-active",
     shutdownBehavior: "cancel",
     completionDebounceMs: finiteInteger(raw.completionDebounceMs, DEFAULT_BACKGROUND_WORK_CONFIG.completionDebounceMs, 0, 10_000),
@@ -76,7 +78,13 @@ export function parseBackgroundWorkConfig(value: unknown): BackgroundWorkConfig 
   };
 }
 
-export function loadBackgroundWorkConfig(): { config: BackgroundWorkConfig; path: string; error?: string } {
+export interface LoadedBackgroundWorkConfig {
+  config: BackgroundWorkConfig;
+  path: string;
+  error?: string;
+}
+
+export function loadBackgroundWorkConfig(): LoadedBackgroundWorkConfig {
   const configPath = backgroundWorkConfigPath();
   try {
     if (!fs.existsSync(configPath)) return { config: { ...DEFAULT_BACKGROUND_WORK_CONFIG }, path: configPath };
@@ -89,6 +97,69 @@ export function loadBackgroundWorkConfig(): { config: BackgroundWorkConfig; path
       error: error instanceof Error ? error.message : String(error),
     };
   }
+}
+
+export function saveBackgroundWorkConfig(config: BackgroundWorkConfig, configPath = backgroundWorkConfigPath()): { backupPath?: string } {
+  let existing: Record<string, unknown> = {};
+  let backupPath: string | undefined;
+  if (fs.existsSync(configPath)) {
+    try {
+      const parsed = JSON.parse(fs.readFileSync(configPath, "utf8"));
+      if (typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)) existing = parsed as Record<string, unknown>;
+      else throw new Error("configuration root is not an object");
+    } catch {
+      backupPath = `${configPath}.invalid-${Date.now()}.bak`;
+      fs.copyFileSync(configPath, backupPath);
+    }
+  }
+  const shortcut = config.shortcut ? normalizeShortcut(config.shortcut) : null;
+  if (config.shortcut && !shortcut) throw new Error(`Invalid shortcut '${config.shortcut}'.`);
+  const { promotionScope: _promotionScope, shutdownBehavior: _shutdownBehavior, ...persisted } = { ...config, shortcut };
+  const next = { ...existing, ...persisted };
+  fs.mkdirSync(path.dirname(configPath), { recursive: true });
+  const temporaryPath = `${configPath}.${process.pid}.${Date.now()}.tmp`;
+  try {
+    fs.writeFileSync(temporaryPath, `${JSON.stringify(next, null, 2)}\n`, { mode: 0o600 });
+    fs.renameSync(temporaryPath, configPath);
+  } catch (error) {
+    try { fs.rmSync(temporaryPath); } catch { /* best-effort temporary-file cleanup */ }
+    throw error;
+  }
+  return backupPath ? { backupPath } : {};
+}
+
+const SHORTCUT_MODIFIER_ORDER = ["ctrl", "shift", "alt", "super"] as const;
+const SHORTCUT_MODIFIERS = new Set<string>(SHORTCUT_MODIFIER_ORDER);
+const SHORTCUT_ALIASES: Record<string, string> = { esc: "escape", return: "enter" };
+const SHORTCUT_SPECIAL_KEYS = new Set([
+  "escape", "enter", "tab", "space", "backspace", "delete", "insert", "clear",
+  "home", "end", "pageup", "pagedown", "up", "down", "left", "right",
+  "f1", "f2", "f3", "f4", "f5", "f6", "f7", "f8", "f9", "f10", "f11", "f12",
+]);
+const SHORTCUT_SYMBOL_KEYS = new Set("`-=[]\\;',./!@#$%^&*()_|~{}:<>?".split(""));
+
+function canonicalShortcut(value: string): string | undefined {
+  const parts = value.trim().toLowerCase().split("+");
+  const rawKey = parts.pop();
+  if (!rawKey || parts.some((part) => !SHORTCUT_MODIFIERS.has(part)) || new Set(parts).size !== parts.length) return undefined;
+  const key = SHORTCUT_ALIASES[rawKey] ?? rawKey;
+  if (!/^[a-z0-9]$/.test(key) && !SHORTCUT_SPECIAL_KEYS.has(key) && !SHORTCUT_SYMBOL_KEYS.has(key)) return undefined;
+  const modifiers = new Set(parts);
+  return [...SHORTCUT_MODIFIER_ORDER.filter((modifier) => modifiers.has(modifier)), key].join("+");
+}
+
+export function normalizeShortcut(value: string): string | undefined {
+  const shortcut = canonicalShortcut(value);
+  if (!shortcut) return undefined;
+  const parts = shortcut.split("+");
+  const key = parts.pop()!;
+  const printable = key.length === 1 || key === "space";
+  if (printable && (parts.length === 0 || parts.every((part) => part === "shift"))) return undefined;
+  return shortcut;
+}
+
+export function isValidShortcut(value: string): boolean {
+  return normalizeShortcut(value) !== undefined;
 }
 
 /**
@@ -107,17 +178,19 @@ const APP_KEYBINDINGS: Record<string, string | string[]> = {
   "app.clipboard.pasteImage": process.platform === "win32" ? "alt+v" : "ctrl+v",
 };
 
-function values(value: string | string[] | undefined): string[] {
-  return value === undefined ? [] : Array.isArray(value) ? value : [value];
+function values(value: unknown): string[] {
+  if (typeof value === "string") return [value];
+  return Array.isArray(value) ? value.filter((item): item is string => typeof item === "string") : [];
 }
 
 /** Detect whether `shortcut` collides with an effective Pi binding (defaults merged with user keybindings.json overrides). */
 export function detectShortcutConflict(shortcut: string | null, keybindingsPath = path.join(os.homedir(), ".pi", "agent", "keybindings.json")): string | undefined {
   if (!shortcut) return undefined;
-  const normalized = shortcut.toLowerCase();
-  let configured: Record<string, string | string[]> = {};
+  const normalized = normalizeShortcut(shortcut);
+  if (!normalized) return "invalid shortcut";
+  let configured: Record<string, unknown> = {};
   try {
-    if (fs.existsSync(keybindingsPath)) configured = JSON.parse(fs.readFileSync(keybindingsPath, "utf8")) as Record<string, string | string[]>;
+    if (fs.existsSync(keybindingsPath)) configured = JSON.parse(fs.readFileSync(keybindingsPath, "utf8")) as Record<string, unknown>;
   } catch {
     return "unreadable keybindings configuration";
   }
@@ -126,7 +199,7 @@ export function detectShortcutConflict(shortcut: string | null, keybindingsPath 
   const actions = new Set([...Object.keys(defaults), ...Object.keys(configured)]);
   for (const action of actions) {
     const effective = Object.hasOwn(configured, action) ? configured[action] : defaults[action];
-    if (values(effective).some((key) => key.toLowerCase() === normalized)) return action;
+    if (values(effective).some((key) => canonicalShortcut(key) === normalized)) return action;
   }
   return undefined;
 }

@@ -1,6 +1,6 @@
 {
   "name": "pi-background-work",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "description": "Promote running Pi shell commands and subagent runs into background jobs \u2014 /background, completion notifications, safe cancellation",
   "type": "module",
   "license": "MIT",
@@ -23,8 +23,8 @@
     "@davecodes/pi-subagents": "0.34.0-bg.1"
   },
   "peerDependencies": {
-    "@earendil-works/pi-coding-agent": "*",
-    "@earendil-works/pi-tui": "*"
+    "@earendil-works/pi-coding-agent": ">=0.80.6",
+    "@earendil-works/pi-tui": ">=0.74.0"
   },
   "devDependencies": {
     "@earendil-works/pi-coding-agent": "^0.80.6",

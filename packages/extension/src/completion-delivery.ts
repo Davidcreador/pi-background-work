@@ -1,4 +1,8 @@
-import type { BackgroundJobCompletion } from "@davecodes/pi-background-work-sdk";
+import {
+  BACKGROUND_WORK_COMPLETION_TYPE,
+  type BackgroundJobCompletion,
+} from "@davecodes/pi-background-work-sdk";
+import type { BackgroundCompletionMessageDetail } from "./completion-message.ts";
 
 export interface CompletionDeliveryPi {
   // Pi exposes enqueue-only delivery: a successful return is not an async acknowledgement that the turn consumed the message.
@@ -40,7 +44,7 @@ function boundedBatchText(value: unknown, maxBytes: number, maxLines: number): s
 
 export interface FormattedCompletionBatch {
   content: string;
-  details: Array<{ jobId: string; status: BackgroundJobCompletion["status"]; summary: string; error?: string; artifactPath?: string }>;
+  details: BackgroundCompletionMessageDetail[];
   jobIds: string[];
 }
 
@@ -58,11 +62,12 @@ export function formatCompletionBatch(
     const details = included.map((completion) => ({
       jobId: boundedString(completion.jobId, 64) ?? "(unknown)",
       status: completion.status,
+      durationMs: completion.durationMs,
       summary: boundedString(completion.summary, 96) ?? "(no summary)",
       ...(completion.error ? { error: boundedString(completion.error, 96) } : {}),
       ...(completion.artifactPath ? { artifactPath: boundedString(completion.artifactPath, 192) } : {}),
     }));
-    const metadataBytes = Buffer.byteLength(JSON.stringify({ version: 1, role: boundedString(options.role, 32), groupId, completions: details }));
+    const metadataBytes = Buffer.byteLength(JSON.stringify({ version: 1, role: boundedString(options.role, 32), groupId, autoResume: false, completions: details }));
     const contentBudget = Math.max(128, options.maxOutputBytes - metadataBytes - 160);
     const perJobBytes = Math.max(32, Math.floor(contentBudget / Math.max(1, included.length * 2)));
     const perJobLines = Math.max(1, Math.floor(options.maxOutputLines / Math.max(1, included.length * 2)));
@@ -76,7 +81,7 @@ export function formatCompletionBatch(
     });
     if (completions.length > count) lines.push(`\n[${completions.length - count} additional completions remain queued]`);
     const content = boundedBatchText(lines.join("\n"), contentBudget, options.maxOutputLines);
-    const total = Buffer.byteLength(JSON.stringify({ customType: "background-work-completion", content, display: true, details: { version: 1, role: boundedString(options.role, 32), groupId, completions: details } }));
+    const total = Buffer.byteLength(JSON.stringify({ customType: BACKGROUND_WORK_COMPLETION_TYPE, content, display: true, details: { version: 1, role: boundedString(options.role, 32), groupId, autoResume: false, completions: details } }));
     if (total <= options.maxOutputBytes) return { content, details, jobIds: included.map((item) => item.jobId) };
   }
   throw new Error(`Completion payload cannot fit configured maxOutputBytes=${options.maxOutputBytes}`);
@@ -93,7 +98,8 @@ export class CompletionDelivery {
       debounceMs: number;
       maxOutputBytes: number;
       maxOutputLines: number;
-      completionBehavior: "notify-and-resume" | "notify-only";
+      completionBehavior: "adaptive" | "notify-and-resume" | "notify-only";
+      shouldResume?(jobIds: string[]): boolean;
       role?: string;
       groupId?: string;
       onQueued(jobIds: string[]): void;
@@ -117,19 +123,22 @@ export class CompletionDelivery {
     if (!completions.length) return;
     try {
       const formatted = formatCompletionBatch(completions, this.options);
+      const triggerTurn = this.options.completionBehavior === "notify-and-resume"
+        || (this.options.completionBehavior === "adaptive" && (this.options.shouldResume?.(formatted.jobIds) ?? false));
       this.pi.sendMessage({
-        customType: "background-work-completion",
+        customType: BACKGROUND_WORK_COMPLETION_TYPE,
         content: formatted.content,
         display: true,
         details: {
           version: 1,
           role: boundedString(this.options.role, 32),
           groupId: boundedString(this.options.groupId, 128),
+          autoResume: triggerTurn,
           completions: formatted.details,
         },
       }, {
         deliverAs: "followUp",
-        triggerTurn: this.options.completionBehavior === "notify-and-resume",
+        triggerTurn,
       });
       // sendMessage only acknowledges enqueue synchronously. Terminal results remain inspectable, but failures after return have no public retry signal.
       this.options.onQueued(formatted.jobIds);
